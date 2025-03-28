@@ -107,7 +107,6 @@
 
     <!-- Polyfills for older browsers -->
     <script src="https://cdn.jsdelivr.net/npm/webrtc-adapter@latest/dist/adapter.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/peerjs@1.4.7/dist/peerjs.min.js"></script>
 
     <script>
     // Feature detection
@@ -119,6 +118,8 @@
 
     class WebRTCFileSharing {
         constructor() {
+            // Configuration
+            this.AUTH_TOKEN = "your-auth-token-here"; // Must match server token
             this.SIGNALING_SERVER = 'wss://82.34.178.68:8443/ws';
             this.configuration = {
                 iceServers: [
@@ -127,8 +128,21 @@
                     { urls: 'stun:stun2.l.google.com:19302' }
                 ]
             };
-            this.CHUNK_SIZE = 16 * 1024; // Reduced for better performance
+            this.CHUNK_SIZE = 16 * 1024; // 16KB chunks for better performance
             
+            // State management
+            this.peerConnection = null;
+            this.dataChannel = null;
+            this.socket = null;
+            this.receivedFiles = [];
+            this.currentFileBuffer = [];
+            this.currentFileInfo = null;
+            this.fileTransferProgress = {};
+            
+            this.initialize();
+        }
+
+        initialize() {
             this.initializeDOMElements();
             this.initializeEventListeners();
             this.initializeTURNServers();
@@ -177,52 +191,349 @@
                     this.log('TURN servers initialized', 'success');
                 }
             } catch (error) {
-                this.logError('TURN server initialization failed, using STUN only', 'warning');
+                this.log('Using STUN servers only: ' + error.message, 'warning');
             }
         }
 
         handleConnect() {
             const peerId = this.elements.peerIdInput.value.trim();
+            const targetPeerId = this.elements.targetPeerIdInput.value.trim();
+            
             if (!peerId) {
                 this.log('Please enter a Peer ID', 'error');
                 return;
             }
 
+            this.setupWebSocketConnection(peerId, targetPeerId);
+        }
+
+        setupWebSocketConnection(peerId, targetPeerId) {
             try {
-                this.setupWebSocketConnection(peerId);
+                this.socket = new WebSocket(this.SIGNALING_SERVER);
+
+                this.socket.onopen = () => {
+                    this.log('Authenticating with signaling server...');
+                    // First message must be authentication
+                    this.socket.send(JSON.stringify({
+                        type: 'authenticate',
+                        token: this.AUTH_TOKEN,
+                        peerId: peerId
+                    }));
+                };
+
+                this.socket.onmessage = (event) => {
+                    try {
+                        const message = JSON.parse(event.data);
+                        
+                        if (message.type === 'auth_success') {
+                            this.log('Authentication successful', 'success');
+                            this.handleSignalingMessage({
+                                type: 'register',
+                                peerId: peerId,
+                                targetPeerId: targetPeerId || null
+                            });
+                            return;
+                        }
+                        
+                        this.handleSignalingMessage(message);
+                    } catch (error) {
+                        this.logError('Message handling error', error);
+                    }
+                };
+
+                this.socket.onerror = (error) => {
+                    this.logError('WebSocket error', error);
+                    this.elements.connectionStatus.textContent = 'Connection failed';
+                };
+
+                this.socket.onclose = (event) => {
+                    const reason = event.reason || 'Unknown reason';
+                    this.log(`Disconnected: ${reason} (Code ${event.code})`, 'warning');
+                    this.elements.connectionStatus.textContent = 'Disconnected';
+                    this.elements.sendFileBtn.disabled = true;
+                    this.elements.fileSection.style.display = 'none';
+                    
+                    // Attempt reconnection after 5 seconds
+                    if (event.code !== 1000) {
+                        setTimeout(() => {
+                            const peerId = this.elements.peerIdInput.value.trim();
+                            const targetPeerId = this.elements.targetPeerIdInput.value.trim();
+                            if (peerId) this.setupWebSocketConnection(peerId, targetPeerId);
+                        }, 5000);
+                    }
+                };
+
             } catch (error) {
-                this.logError('Connection failed', error);
+                this.logError('WebSocket connection failed', error);
             }
         }
 
-        setupWebSocketConnection(peerId) {
-            this.socket = new WebSocket(this.SIGNALING_SERVER);
+        handleSignalingMessage(message) {
+            switch(message.type) {
+                case 'offer':
+                    this.handleOffer(message);
+                    break;
+                case 'answer':
+                    this.handleAnswer(message);
+                    break;
+                case 'ice-candidate':
+                    this.handleIceCandidate(message);
+                    break;
+                case 'error':
+                    this.log(message.message || 'Unknown error', 'error');
+                    break;
+                default:
+                    this.log(`Unknown message type: ${message.type}`);
+            }
+        }
 
-            this.socket.onopen = () => {
-                this.log('Connected to signaling server', 'success');
-                this.sendMessage({ type: 'register', peerId });
-            };
+        async createPeerConnection() {
+            this.peerConnection = new RTCPeerConnection(this.configuration);
+            
+            this.dataChannel = this.peerConnection.createDataChannel("fileTransfer", {
+                ordered: true,
+                maxPacketLifeTime: 3000
+            });
+            
+            this.setupDataChannelHandlers();
 
-            this.socket.onmessage = (event) => {
-                try {
-                    const message = JSON.parse(event.data);
-                    this.handleSignalingMessage(message);
-                } catch (error) {
-                    this.logError('Message handling error', error);
+            this.peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    this.socket.send(JSON.stringify({
+                        type: 'ice-candidate',
+                        candidate: event.candidate
+                    }));
                 }
             };
 
-            this.socket.onerror = (error) => {
-                this.logError('WebSocket error', error);
+            this.peerConnection.oniceconnectionstatechange = () => {
+                const state = this.peerConnection.iceConnectionState;
+                this.log(`ICE connection state: ${state}`);
+                if (state === 'disconnected' || state === 'failed') {
+                    this.cleanupPeerConnection();
+                }
             };
 
-            this.socket.onclose = () => {
-                this.log('Disconnected from signaling server', 'warning');
+            this.peerConnection.ondatachannel = (event) => {
+                this.dataChannel = event.channel;
+                this.setupDataChannelHandlers();
             };
         }
 
-        // ... [Include all other methods from your original class] ...
-        // Make sure to add proper error handling in each method
+        setupDataChannelHandlers() {
+            this.dataChannel.onopen = () => {
+                this.elements.connectionStatus.textContent = 'Connected (P2P)';
+                this.elements.sendFileBtn.disabled = false;
+                this.elements.fileSection.style.display = 'block';
+                this.log('Data channel ready for file transfer', 'success');
+            };
+
+            this.dataChannel.onclose = () => {
+                this.log('Data channel closed', 'warning');
+                this.elements.connectionStatus.textContent = 'Disconnected';
+                this.elements.sendFileBtn.disabled = true;
+            };
+
+            this.dataChannel.onmessage = (event) => {
+                this.handleIncomingMessage(event.data);
+            };
+
+            this.dataChannel.onerror = (error) => {
+                this.logError('Data channel error', error);
+            };
+        }
+
+        async handleOffer(message) {
+            try {
+                await this.createPeerConnection();
+                await this.peerConnection.setRemoteDescription(
+                    new RTCSessionDescription(message.offer)
+                );
+                
+                const answer = await this.peerConnection.createAnswer();
+                await this.peerConnection.setLocalDescription(answer);
+                
+                this.socket.send(JSON.stringify({
+                    type: 'answer',
+                    sourcePeerId: message.targetPeerId,
+                    targetPeerId: message.sourcePeerId,
+                    answer: answer
+                }));
+            } catch (error) {
+                this.logError('Offer handling failed', error);
+            }
+        }
+
+        async handleAnswer(message) {
+            try {
+                if (!this.peerConnection) {
+                    throw new Error('No active peer connection');
+                }
+                await this.peerConnection.setRemoteDescription(
+                    new RTCSessionDescription(message.answer)
+                );
+            } catch (error) {
+                this.logError('Answer handling failed', error);
+            }
+        }
+
+        async handleIceCandidate(message) {
+            try {
+                if (!this.peerConnection) return;
+                await this.peerConnection.addIceCandidate(
+                    new RTCIceCandidate(message.candidate)
+                );
+            } catch (error) {
+                this.logError('ICE candidate error', error);
+            }
+        }
+
+        handleFileSend() {
+            const files = this.elements.fileInput.files;
+            if (!files.length || !this.dataChannel || 
+                this.dataChannel.readyState !== 'open') return;
+                
+            Array.from(files).forEach(file => this.sendFile(file));
+        }
+
+        sendFile(file) {
+            const fileInfo = {
+                name: file.name,
+                size: file.size,
+                type: file.type,
+                lastModified: file.lastModified
+            };
+
+            this.fileTransferProgress[fileInfo.name] = {
+                sent: 0,
+                total: fileInfo.size
+            };
+
+            // Send file metadata first
+            this.dataChannel.send(JSON.stringify({
+                type: 'fileInfo',
+                data: fileInfo
+            }));
+
+            const reader = new FileReader();
+            let offset = 0;
+
+            const readNextChunk = () => {
+                const slice = file.slice(offset, offset + this.CHUNK_SIZE);
+                reader.readAsArrayBuffer(slice);
+            };
+
+            reader.onload = (e) => {
+                const chunk = e.target.result;
+                this.dataChannel.send(JSON.stringify({
+                    type: 'fileChunk',
+                    name: fileInfo.name,
+                    data: Array.from(new Uint8Array(chunk)),
+                    offset: offset
+                }));
+
+                offset += chunk.byteLength;
+                this.fileTransferProgress[fileInfo.name].sent = offset;
+
+                // Update progress
+                const percent = Math.round((offset / fileInfo.size) * 100);
+                this.log(`Sending ${fileInfo.name}: ${percent}%`);
+                
+                if (offset < fileInfo.size) {
+                    readNextChunk();
+                } else {
+                    this.log(`Finished sending ${fileInfo.name}`, 'success');
+                    delete this.fileTransferProgress[fileInfo.name];
+                }
+            };
+
+            reader.onerror = (error) => {
+                this.logError('File read error', error);
+            };
+
+            readNextChunk();
+            this.log(`Starting transfer of ${file.name} (${this.formatFileSize(file.size)})`);
+        }
+
+        handleIncomingMessage(message) {
+            try {
+                const data = JSON.parse(message);
+                
+                switch(data.type) {
+                    case 'fileInfo':
+                        this.currentFileInfo = data.data;
+                        this.currentFileBuffer = [];
+                        
+                        // Create progress UI
+                        const progressContainer = document.createElement('div');
+                        progressContainer.id = `progress-${this.currentFileInfo.name}`;
+                        progressContainer.innerHTML = `
+                            <p>Receiving: ${this.currentFileInfo.name}</p>
+                            <div class="progress-bar">
+                                <div class="progress-bar-fill" style="width: 0%"></div>
+                            </div>
+                        `;
+                        this.elements.receivedFilesList.appendChild(progressContainer);
+                        break;
+                        
+                    case 'fileChunk':
+                        if (!this.currentFileInfo) return;
+                        
+                        this.currentFileBuffer.push(...data.data);
+                        const receivedBytes = this.currentFileBuffer.length;
+                        const totalBytes = this.currentFileInfo.size;
+                        
+                        // Update progress
+                        const percent = Math.round((receivedBytes / totalBytes) * 100);
+                        const progressBar = document.querySelector(
+                            `#progress-${this.currentFileInfo.name} .progress-bar-fill`
+                        );
+                        if (progressBar) progressBar.style.width = `${percent}%`;
+                        
+                        // Check if transfer complete
+                        if (receivedBytes >= totalBytes) {
+                            this.saveReceivedFile();
+                        }
+                        break;
+                }
+            } catch (error) {
+                this.logError('Message processing error', error);
+            }
+        }
+
+        saveReceivedFile() {
+            if (!this.currentFileInfo) return;
+            
+            const blob = new Blob([new Uint8Array(this.currentFileBuffer)], {
+                type: this.currentFileInfo.type
+            });
+            
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = this.currentFileInfo.name;
+            link.textContent = `${this.currentFileInfo.name} (${this.formatFileSize(this.currentFileInfo.size)})`;
+            
+            const listItem = document.createElement('li');
+            listItem.appendChild(link);
+            this.elements.receivedFilesList.appendChild(listItem);
+            
+            // Clean up
+            const progressContainer = document.getElementById(`progress-${this.currentFileInfo.name}`);
+            if (progressContainer) progressContainer.remove();
+            
+            this.receivedFiles.push(this.currentFileInfo);
+            this.currentFileInfo = null;
+            this.currentFileBuffer = [];
+            
+            this.log(`File received successfully`, 'success');
+        }
+
+        formatFileSize(bytes) {
+            if (bytes < 1024) return `${bytes} bytes`;
+            if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
+            return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+        }
 
         log(message, type = 'info') {
             const entry = document.createElement('div');
@@ -230,7 +541,6 @@
             entry.className = type;
             this.elements.logElement.appendChild(entry);
             this.elements.logElement.scrollTop = this.elements.logElement.scrollHeight;
-            console[type === 'error' ? 'error' : 'log'](message);
         }
 
         logError(context, error) {
@@ -239,20 +549,36 @@
             console.error(context, error);
         }
 
+        cleanupPeerConnection() {
+            if (this.dataChannel) {
+                this.dataChannel.close();
+                this.dataChannel = null;
+            }
+            if (this.peerConnection) {
+                this.peerConnection.close();
+                this.peerConnection = null;
+            }
+        }
+
         cleanup() {
-            if (this.socket) this.socket.close();
-            if (this.peerConnection) this.peerConnection.close();
+            if (this.socket) {
+                this.socket.close();
+                this.socket = null;
+            }
+            this.cleanupPeerConnection();
         }
     }
 
     // Initialize with error handling
-    try {
-        new WebRTCFileSharing();
-    } catch (error) {
-        console.error("Initialization error:", error);
-        document.getElementById('log').innerHTML += 
-            `<div class="error">Initialization failed: ${error.message}</div>`;
-    }
+    document.addEventListener('DOMContentLoaded', () => {
+        try {
+            new WebRTCFileSharing();
+        } catch (error) {
+            console.error("Initialization error:", error);
+            document.getElementById('log').innerHTML = 
+                `<div class="error">Initialization failed: ${error.message}</div>`;
+        }
+    });
     </script>
 </body>
 </html>
