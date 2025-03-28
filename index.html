@@ -213,44 +213,37 @@
         }
 
         connectToSignalingServer(peerId, targetPeerId) {
-            try {
-                this.socket = new WebSocket(this.SIGNALING_SERVER);
+    try {
+        this.socket = new WebSocket(this.SIGNALING_SERVER);
 
-                this.socket.onopen = () => {
-                    this.log(`Connected to Signaling Server. Peer ID: ${peerId}`);
-                    
-                    const message = {
-                        type: 'register',
-                        peerId: peerId,
-                        targetPeerId: targetPeerId || null
-                    };
-                    this.socket.send(JSON.stringify(message));
+        this.socket.onopen = () => {
+            this.log(`Connected to Signaling Server. Peer ID: ${peerId}`);
+            // ... rest of your onopen code ...
+        };
 
-                    if (targetPeerId) {
-                        this.initiateConnection(peerId, targetPeerId);
-                    }
-                };
+        // Enhanced error handling:
+        this.socket.onerror = (error) => {
+            const errorMessages = {
+                'ECONNREFUSED': 'Server not running or port blocked',
+                'ETIMEDOUT': 'Connection timed out',
+                'EHOSTUNREACH': 'Server unreachable'
+            };
+            const message = errorMessages[error.code] || 
+                          `WebSocket Error: ${error.message || 'Unknown error'}`;
+            this.log(message, 'error');
+            
+            // Auto-reconnect after 5 seconds
+            setTimeout(() => this.connectToSignalingServer(peerId, targetPeerId), 5000);
+        };
 
-                this.socket.onmessage = async (event) => {
-                    try {
-                        const message = JSON.parse(event.data);
-                        this.log(`Received: ${JSON.stringify(message)}`);
+        this.socket.onclose = (event) => {
+            this.log(`Disconnected: ${event.reason || 'Unknown reason'} (Code ${event.code})`, 'warning');
+        };
 
-                        switch(message.type) {
-                            case 'offer':
-                                await this.handleOffer(message);
-                                break;
-                            case 'answer':
-                                await this.handleAnswer(message);
-                                break;
-                            case 'ice-candidate':
-                                await this.handleIceCandidate(message);
-                                break;
-                        }
-                    } catch (error) {
-                        this.log(`Message handling error: ${error}`, 'error');
-                    }
-                };
+    } catch (error) {
+        this.log(`Connection error: ${error.message}`, 'error');
+    }
+}
 
                 this.socket.onerror = (error) => {
                     this.log(`WebSocket Error: ${error}`, 'error');
