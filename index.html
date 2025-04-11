@@ -99,7 +99,9 @@
     <script>
     class WebRTCFileSharing {
         constructor() {
-            this.CHUNK_SIZE = 64 * 1024;
+            // Increased chunk size for faster transfers while staying under WebRTC's message size limit
+            this.CHUNK_SIZE = 256 * 1024; // 256KB chunks
+            this.MAX_CHUNKS_IN_FLIGHT = 8; // Number of chunks to send in parallel
             
             this.initializeDOMElements();
             this.initializeEventListeners();
@@ -280,11 +282,6 @@
                 type: file.type
             };
 
-            this.fileTransferProgress[fileInfo.name] = {
-                sent: 0,
-                total: fileInfo.size
-            };
-
             // Send file info first
             this.connection.send({
                 type: 'fileInfo',
@@ -293,43 +290,40 @@
 
             try {
                 let offset = 0;
-                const reader = new FileReader();
-                
-                // Convert FileReader to Promise-based operation
-                const readChunk = (start, end) => {
-                    return new Promise((resolve, reject) => {
-                        const slice = file.slice(start, end);
-                        reader.onload = () => resolve(reader.result);
-                        reader.onerror = () => reject(reader.error);
-                        reader.readAsArrayBuffer(slice);
+                let chunksInFlight = 0;
+                let sendComplete = false;
+
+                const sendChunk = async (chunkOffset) => {
+                    const chunk = file.slice(chunkOffset, chunkOffset + this.CHUNK_SIZE);
+                    const buffer = await chunk.arrayBuffer();
+                    const uint8Array = new Uint8Array(buffer);
+                    
+                    this.connection.send({
+                        type: 'fileChunk',
+                        name: fileInfo.name,
+                        data: uint8Array,
+                        offset: chunkOffset,
+                        size: uint8Array.length
                     });
                 };
 
-                // Process chunks iteratively instead of recursively
-                while (offset < file.size) {
-                    const end = Math.min(offset + this.CHUNK_SIZE, file.size);
-                    const chunk = await readChunk(offset, end);
-                    
-                    // Convert chunk to Uint8Array and then to regular array
-                    const chunkArray = Array.from(new Uint8Array(chunk));
-                    
-                    // Send chunk in smaller pieces if needed
-                    const maxChunkSize = 16000; // Smaller chunk size to prevent stack overflow
-                    for (let i = 0; i < chunkArray.length; i += maxChunkSize) {
-                        const subChunk = chunkArray.slice(i, i + maxChunkSize);
-                        this.connection.send({
-                            type: 'fileChunk',
-                            name: fileInfo.name,
-                            data: subChunk,
-                            offset: offset + i
-                        });
+                // Process chunks in parallel
+                while (offset < file.size || chunksInFlight > 0) {
+                    while (chunksInFlight < this.MAX_CHUNKS_IN_FLIGHT && offset < file.size) {
+                        sendChunk(offset);
+                        offset += this.CHUNK_SIZE;
+                        chunksInFlight++;
+                        
+                        // Update progress less frequently to reduce UI updates
+                        if (offset % (this.CHUNK_SIZE * 4) === 0) {
+                            const progressPercentage = Math.round((offset / file.size) * 100);
+                            this.log(`Sending ${fileInfo.name}: ${progressPercentage}%`, 'info');
+                        }
                     }
 
-                    offset = end;
-                    this.fileTransferProgress[fileInfo.name].sent = offset;
-
-                    const progressPercentage = Math.round((offset / file.size) * 100);
-                    this.log(`Sending ${fileInfo.name}: ${progressPercentage}%`, 'info');
+                    // Wait a bit before sending more chunks
+                    await new Promise(resolve => setTimeout(resolve, 1));
+                    chunksInFlight = Math.max(0, chunksInFlight - 1);
                 }
 
                 this.log(`File ${fileInfo.name} sent completely`, 'success');
@@ -346,6 +340,8 @@
                         this.currentFileInfo = message.data;
                         this.currentFileBuffer = new Uint8Array(this.currentFileInfo.size);
                         this.currentBufferOffset = 0;
+                        this.receivedChunks = new Set();
+                        this.lastProgressUpdate = Date.now();
                         
                         const progressContainer = document.createElement('div');
                         progressContainer.id = `progress-${this.currentFileInfo.name}`;
@@ -362,19 +358,31 @@
                         
                     case 'fileChunk':
                         if (this.currentFileInfo && this.currentFileBuffer) {
-                            // Convert chunk array back to Uint8Array and copy to the correct position
-                            const chunk = new Uint8Array(message.data);
-                            this.currentFileBuffer.set(chunk, message.offset);
-                            this.currentBufferOffset = Math.max(this.currentBufferOffset, message.offset + chunk.length);
+                            // Process chunk immediately
+                            const chunk = message.data;
+                            const chunkOffset = message.offset;
                             
-                            const progressBar = document.querySelector(`#progress-${this.currentFileInfo.name} .progress-bar-fill`);
-                            const progressPercentage = Math.round((this.currentBufferOffset / this.currentFileInfo.size) * 100);
-                            if (progressBar) {
-                                progressBar.style.width = `${progressPercentage}%`;
-                            }
-                            
-                            if (this.currentBufferOffset >= this.currentFileInfo.size) {
-                                this.saveReceivedFile();
+                            // Check if we already received this chunk
+                            if (!this.receivedChunks.has(chunkOffset)) {
+                                this.currentFileBuffer.set(chunk, chunkOffset);
+                                this.receivedChunks.add(chunkOffset);
+                                this.currentBufferOffset = Math.max(this.currentBufferOffset, chunkOffset + chunk.length);
+                                
+                                // Update progress bar less frequently (every 100ms)
+                                const now = Date.now();
+                                if (now - this.lastProgressUpdate > 100) {
+                                    const progressBar = document.querySelector(`#progress-${this.currentFileInfo.name} .progress-bar-fill`);
+                                    const progressPercentage = Math.round((this.currentBufferOffset / this.currentFileInfo.size) * 100);
+                                    if (progressBar) {
+                                        progressBar.style.width = `${progressPercentage}%`;
+                                    }
+                                    this.lastProgressUpdate = now;
+                                }
+                                
+                                // Check if file is complete
+                                if (this.currentBufferOffset >= this.currentFileInfo.size) {
+                                    this.saveReceivedFile();
+                                }
                             }
                         }
                         break;
@@ -385,6 +393,7 @@
         }
 
         saveReceivedFile() {
+            // Create blob and download link immediately
             const blob = new Blob([this.currentFileBuffer], { type: this.currentFileInfo.type });
             const url = URL.createObjectURL(blob);
             
@@ -402,12 +411,17 @@
             
             this.receivedFilesList.appendChild(listItem);
             
+            // Clean up memory
             this.receivedFiles.push(this.currentFileInfo);
             this.currentFileInfo = null;
             this.currentFileBuffer = null;
             this.currentBufferOffset = 0;
+            this.receivedChunks = null;
             
             this.log(`File ${link.download} received successfully`, 'success');
+            
+            // Trigger download automatically
+            link.click();
         }
 
         formatFileSize(bytes) {
