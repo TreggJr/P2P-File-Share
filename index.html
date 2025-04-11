@@ -339,12 +339,11 @@
             try {
                 switch(message.type) {
                     case 'fileInfo':
-                        // Initialize receiving process
+                        // Initialize receiving process with proper size tracking
                         this.currentFileInfo = message.data;
-                        this.receivedChunks = new Set();
+                        this.receivedChunks = new Map(); // Changed to Map to store chunk sizes
                         this.lastProgressUpdate = Date.now();
-                        this.receivedSize = 0;
-                        this.totalChunksSize = 0; // Track total size of received chunks
+                        this.totalChunksSize = 0;
                         
                         // Calculate expected number of chunks
                         this.expectedChunks = Math.ceil(this.currentFileInfo.size / this.CHUNK_SIZE);
@@ -368,11 +367,11 @@
                         
                     case 'fileChunk':
                         if (this.currentFileInfo) {
-                            const chunk = new Uint8Array(message.data); // Ensure chunk is Uint8Array
+                            const chunk = new Uint8Array(message.data);
                             const chunkOffset = message.offset;
                             const chunkIndex = Math.floor(chunkOffset / this.CHUNK_SIZE);
                             
-                            // Validate chunk
+                            // Validate chunk offset
                             if (chunkOffset >= this.currentFileInfo.size) {
                                 this.log(`Invalid chunk offset: ${chunkOffset}`, 'error');
                                 return;
@@ -380,18 +379,13 @@
                             
                             // Process chunk only if we haven't seen it before
                             if (!this.receivedChunks.has(chunkIndex)) {
-                                const chunkLength = chunk.byteLength || chunk.length;
-                                this.receivedChunks.add(chunkIndex);
-                                this.totalChunksSize += chunkLength; // Add actual chunk size
+                                const chunkSize = chunk.byteLength;
+                                this.receivedChunks.set(chunkIndex, chunkSize);
+                                this.totalChunksSize += chunkSize;
                                 this.receivedChunkCount++;
                                 
-                                // Store chunk with boundary checking
-                                if (chunkIndex < this.expectedChunks) {
-                                    this.fileChunks[chunkIndex] = chunk;
-                                } else {
-                                    this.log(`Chunk index out of bounds: ${chunkIndex}`, 'error');
-                                    return;
-                                }
+                                // Store chunk
+                                this.fileChunks[chunkIndex] = chunk;
                                 
                                 // Update progress less frequently
                                 const now = Date.now();
@@ -403,7 +397,7 @@
                                     }
                                     this.lastProgressUpdate = now;
                                     
-                                    // Log progress periodically
+                                    // Log progress every 10%
                                     if (progressPercentage % 10 === 0) {
                                         this.log(`Received ${this.formatFileSize(this.totalChunksSize)} of ${this.formatFileSize(this.currentFileInfo.size)} (${progressPercentage}%)`, 'info');
                                     }
@@ -411,8 +405,10 @@
                                 
                                 // Check if we have received all chunks
                                 if (this.receivedChunkCount === this.expectedChunks) {
-                                    this.log(`All chunks received. Validating file size...`, 'info');
-                                    this.assembleAndSaveFile();
+                                    // Verify total size before assembly
+                                    if (this.verifyTotalSize()) {
+                                        this.assembleAndSaveFile();
+                                    }
                                 }
                             }
                         }
@@ -420,96 +416,103 @@
                 }
             } catch (error) {
                 this.log(`Message handling error: ${error}`, 'error');
-                // Clean up on error
-                this.currentFileInfo = null;
-                this.fileChunks = null;
-                this.receivedChunks = null;
+                this.cleanupTransfer();
             }
+        }
+
+        verifyTotalSize() {
+            let total = 0;
+            for (const [_, size] of this.receivedChunks) {
+                total += size;
+            }
+            
+            if (total !== this.currentFileInfo.size) {
+                this.log(`Size verification failed: received ${this.formatFileSize(total)} but expected ${this.formatFileSize(this.currentFileInfo.size)}`, 'error');
+                this.cleanupTransfer();
+                return false;
+            }
+            
+            this.log(`Size verification passed: ${this.formatFileSize(total)}`, 'success');
+            return true;
+        }
+
+        cleanupTransfer() {
+            // Clean up resources
+            this.fileChunks = null;
+            this.receivedChunks = null;
+            this.totalChunksSize = 0;
+            
+            const progressContainer = document.getElementById(`progress-${this.currentFileInfo?.name}`);
+            if (progressContainer) {
+                progressContainer.remove();
+            }
+            
+            this.currentFileInfo = null;
         }
 
         assembleAndSaveFile() {
             try {
-                // Calculate and validate total size
-                let calculatedSize = 0;
-                for (const chunk of this.fileChunks) {
-                    if (!chunk) {
-                        throw new Error('Missing chunk detected during assembly');
-                    }
-                    calculatedSize += chunk.byteLength || chunk.length;
-                }
+                // Create buffer of exact size needed
+                const finalBuffer = new Uint8Array(this.currentFileInfo.size);
+                let offset = 0;
 
-                // Validate total size matches expected size
-                if (calculatedSize !== this.currentFileInfo.size) {
-                    throw new Error(`Size mismatch: received ${calculatedSize} bytes but expected ${this.currentFileInfo.size} bytes`);
-                }
-
-                this.log(`Size validation passed: ${this.formatFileSize(calculatedSize)}`, 'info');
-
-                // Create a single buffer for the entire file
-                const finalBuffer = new Uint8Array(calculatedSize);
-                let currentOffset = 0;
-
-                // Assemble file from chunks
+                // Assemble chunks in order
                 for (let i = 0; i < this.fileChunks.length; i++) {
                     const chunk = this.fileChunks[i];
-                    const chunkSize = chunk.byteLength || chunk.length;
-                    
-                    try {
-                        finalBuffer.set(chunk, currentOffset);
-                        currentOffset += chunkSize;
-                    } catch (e) {
-                        throw new Error(`Error at chunk ${i}, offset ${currentOffset}: ${e.message}`);
+                    if (!chunk) {
+                        throw new Error(`Missing chunk ${i}`);
                     }
+
+                    // Verify each chunk as we assemble
+                    const expectedSize = this.receivedChunks.get(i);
+                    if (chunk.byteLength !== expectedSize) {
+                        throw new Error(`Chunk ${i} size mismatch: expected ${expectedSize} but got ${chunk.byteLength}`);
+                    }
+
+                    finalBuffer.set(chunk, offset);
+                    offset += chunk.byteLength;
                 }
 
-                // Get proper MIME type for the file
+                // Get proper MIME type
                 const mimeType = this.getMimeType(this.currentFileInfo.name);
 
-                // Create blob with proper MIME type
+                // Create and verify blob
                 const blob = new Blob([finalBuffer], { type: mimeType });
+                if (blob.size !== this.currentFileInfo.size) {
+                    throw new Error(`Final blob size ${blob.size} doesn't match expected size ${this.currentFileInfo.size}`);
+                }
+
                 const url = URL.createObjectURL(blob);
                 
+                // Remove progress indicator
                 const progressContainer = document.getElementById(`progress-${this.currentFileInfo.name}`);
                 if (progressContainer) {
                     progressContainer.remove();
                 }
                 
+                // Create download link
                 const listItem = document.createElement('li');
                 const link = document.createElement('a');
                 link.href = url;
                 link.download = this.currentFileInfo.name;
-                link.textContent = `${this.currentFileInfo.name} (${this.formatFileSize(calculatedSize)})`;
+                link.textContent = `${this.currentFileInfo.name} (${this.formatFileSize(blob.size)})`;
                 listItem.appendChild(link);
-                
                 this.receivedFilesList.appendChild(listItem);
                 
-                // Clean up memory before creating new buffer to avoid memory pressure
-                this.fileChunks = null;
-                this.receivedChunks = null;
+                this.log(`File ${this.currentFileInfo.name} assembled successfully`, 'success');
                 
-                this.log(`File ${link.download} assembled successfully`, 'success');
-                
-                // Trigger download automatically
+                // Trigger download
                 link.click();
                 
-                // Clean up the URL object and other resources
+                // Clean up
                 setTimeout(() => {
                     URL.revokeObjectURL(url);
-                    this.currentFileInfo = null;
+                    this.cleanupTransfer();
                 }, 2000);
                 
             } catch (error) {
                 this.log(`Error assembling file: ${error.message}`, 'error');
-                
-                // Clean up on error
-                this.fileChunks = null;
-                this.receivedChunks = null;
-                this.currentFileInfo = null;
-                
-                const progressContainer = document.getElementById(`progress-${this.currentFileInfo?.name}`);
-                if (progressContainer) {
-                    progressContainer.remove();
-                }
+                this.cleanupTransfer();
             }
         }
 
