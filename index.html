@@ -103,6 +103,10 @@
             this.CHUNK_SIZE = 256 * 1024; // 256KB chunks
             this.MAX_CHUNKS_IN_FLIGHT = 8; // Number of chunks to send in parallel
             
+            // Add chunk tracking
+            this.expectedChunks = 0;
+            this.receivedChunkCount = 0;
+
             this.initializeDOMElements();
             this.initializeEventListeners();
             
@@ -339,15 +343,16 @@
                     case 'fileInfo':
                         // Initialize receiving process
                         this.currentFileInfo = message.data;
-                        this.currentFileBuffer = new Uint8Array(this.currentFileInfo.size);
-                        this.currentBufferOffset = 0;
                         this.receivedChunks = new Set();
                         this.lastProgressUpdate = Date.now();
                         this.receivedSize = 0;
                         
-                        // Pre-create blob parts array for streaming assembly
-                        this.blobParts = [];
-                        this.nextExpectedOffset = 0;
+                        // Calculate expected number of chunks
+                        this.expectedChunks = Math.ceil(this.currentFileInfo.size / this.CHUNK_SIZE);
+                        this.receivedChunkCount = 0;
+                        
+                        // Initialize array to store chunks
+                        this.fileChunks = new Array(this.expectedChunks);
                         
                         const progressContainer = document.createElement('div');
                         progressContainer.id = `progress-${this.currentFileInfo.name}`;
@@ -359,22 +364,23 @@
                         `;
                         this.receivedFilesList.appendChild(progressContainer);
                         
-                        this.log(`Receiving file: ${this.currentFileInfo.name}`, 'info');
+                        this.log(`Receiving file: ${this.currentFileInfo.name} (${this.formatFileSize(this.currentFileInfo.size)})`, 'info');
                         break;
                         
                     case 'fileChunk':
-                        if (this.currentFileInfo && this.currentFileBuffer) {
+                        if (this.currentFileInfo) {
                             const chunk = message.data;
                             const chunkOffset = message.offset;
+                            const chunkIndex = Math.floor(chunkOffset / this.CHUNK_SIZE);
                             
                             // Process chunk only if we haven't seen it before
-                            if (!this.receivedChunks.has(chunkOffset)) {
-                                this.receivedChunks.add(chunkOffset);
+                            if (!this.receivedChunks.has(chunkIndex)) {
+                                this.receivedChunks.add(chunkIndex);
                                 this.receivedSize += chunk.length;
+                                this.receivedChunkCount++;
                                 
-                                // Store chunk directly in blobParts array at correct position
-                                const chunkIndex = Math.floor(chunkOffset / this.CHUNK_SIZE);
-                                this.blobParts[chunkIndex] = new Blob([chunk]);
+                                // Store chunk in array
+                                this.fileChunks[chunkIndex] = new Uint8Array(chunk);
                                 
                                 // Update progress less frequently
                                 const now = Date.now();
@@ -387,12 +393,9 @@
                                     this.lastProgressUpdate = now;
                                 }
                                 
-                                // Check if we can process contiguous chunks
-                                this.processContiguousChunks();
-                                
-                                // If all chunks received, finalize the file
-                                if (this.receivedSize >= this.currentFileInfo.size) {
-                                    this.finalizeAndSaveFile();
+                                // Check if we have received all chunks
+                                if (this.receivedChunkCount === this.expectedChunks) {
+                                    this.assembleAndSaveFile();
                                 }
                             }
                         }
@@ -403,47 +406,55 @@
             }
         }
 
-        processContiguousChunks() {
-            // Process chunks that have arrived in order
-            while (this.blobParts[Math.floor(this.nextExpectedOffset / this.CHUNK_SIZE)]) {
-                this.nextExpectedOffset += this.CHUNK_SIZE;
-            }
-        }
+        assembleAndSaveFile() {
+            try {
+                // Create a single Uint8Array to hold the entire file
+                const finalBuffer = new Uint8Array(this.currentFileInfo.size);
+                let offset = 0;
 
-        finalizeAndSaveFile() {
-            // Create final blob from all parts
-            const blob = new Blob(this.blobParts.filter(Boolean), { type: this.currentFileInfo.type });
-            const url = URL.createObjectURL(blob);
-            
-            const progressContainer = document.getElementById(`progress-${this.currentFileInfo.name}`);
-            if (progressContainer) {
-                progressContainer.remove();
+                // Combine all chunks in order
+                for (let i = 0; i < this.fileChunks.length; i++) {
+                    const chunk = this.fileChunks[i];
+                    if (chunk) {
+                        finalBuffer.set(chunk, offset);
+                        offset += chunk.length;
+                    }
+                }
+
+                // Create blob and trigger download
+                const blob = new Blob([finalBuffer], { type: this.currentFileInfo.type });
+                const url = URL.createObjectURL(blob);
+                
+                const progressContainer = document.getElementById(`progress-${this.currentFileInfo.name}`);
+                if (progressContainer) {
+                    progressContainer.remove();
+                }
+                
+                const listItem = document.createElement('li');
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = this.currentFileInfo.name;
+                link.textContent = `${this.currentFileInfo.name} (${this.formatFileSize(this.currentFileInfo.size)})`;
+                listItem.appendChild(link);
+                
+                this.receivedFilesList.appendChild(listItem);
+                
+                // Clean up memory
+                this.receivedFiles.push(this.currentFileInfo);
+                this.currentFileInfo = null;
+                this.fileChunks = null;
+                this.receivedChunks = null;
+                
+                this.log(`File ${link.download} received successfully`, 'success');
+                
+                // Trigger download automatically
+                link.click();
+                
+                // Clean up the URL object after a short delay
+                setTimeout(() => URL.revokeObjectURL(url), 100);
+            } catch (error) {
+                this.log(`Error assembling file: ${error.message}`, 'error');
             }
-            
-            const listItem = document.createElement('li');
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = this.currentFileInfo.name;
-            link.textContent = `${this.currentFileInfo.name} (${this.formatFileSize(this.currentFileInfo.size)})`;
-            listItem.appendChild(link);
-            
-            this.receivedFilesList.appendChild(listItem);
-            
-            // Clean up memory
-            this.receivedFiles.push(this.currentFileInfo);
-            this.currentFileInfo = null;
-            this.currentFileBuffer = null;
-            this.receivedChunks = null;
-            this.blobParts = null;
-            this.nextExpectedOffset = 0;
-            
-            this.log(`File ${link.download} received successfully`, 'success');
-            
-            // Trigger download automatically
-            link.click();
-            
-            // Clean up the URL object
-            setTimeout(() => URL.revokeObjectURL(url), 100);
         }
 
         formatFileSize(bytes) {
