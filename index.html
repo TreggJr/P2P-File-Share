@@ -283,7 +283,7 @@
             const fileInfo = {
                 name: file.name,
                 size: file.size,
-                type: file.type
+                type: this.getMimeType(file.name) // Use proper MIME type
             };
 
             // Send file info first
@@ -295,7 +295,6 @@
             try {
                 let offset = 0;
                 let chunksInFlight = 0;
-                let sendComplete = false;
 
                 const sendChunk = async (chunkOffset) => {
                     const chunk = file.slice(chunkOffset, chunkOffset + this.CHUNK_SIZE);
@@ -306,19 +305,18 @@
                         type: 'fileChunk',
                         name: fileInfo.name,
                         data: uint8Array,
-                        offset: chunkOffset,
-                        size: uint8Array.length
+                        offset: chunkOffset
                     });
                 };
 
                 // Process chunks in parallel
                 while (offset < file.size || chunksInFlight > 0) {
                     while (chunksInFlight < this.MAX_CHUNKS_IN_FLIGHT && offset < file.size) {
-                        sendChunk(offset);
+                        await sendChunk(offset);
                         offset += this.CHUNK_SIZE;
                         chunksInFlight++;
                         
-                        // Update progress less frequently to reduce UI updates
+                        // Update progress less frequently
                         if (offset % (this.CHUNK_SIZE * 4) === 0) {
                             const progressPercentage = Math.round((offset / file.size) * 100);
                             this.log(`Sending ${fileInfo.name}: ${progressPercentage}%`, 'info');
@@ -379,8 +377,8 @@
                                 this.receivedSize += chunk.length;
                                 this.receivedChunkCount++;
                                 
-                                // Store chunk in array
-                                this.fileChunks[chunkIndex] = new Uint8Array(chunk);
+                                // Store chunk directly as Uint8Array
+                                this.fileChunks[chunkIndex] = chunk;
                                 
                                 // Update progress less frequently
                                 const now = Date.now();
@@ -406,23 +404,58 @@
             }
         }
 
+        getMimeType(fileName) {
+            const extension = fileName.split('.').pop().toLowerCase();
+            const mimeTypes = {
+                'txt': 'text/plain',
+                'html': 'text/html',
+                'css': 'text/css',
+                'js': 'text/javascript',
+                'json': 'application/json',
+                'pdf': 'application/pdf',
+                'jpg': 'image/jpeg',
+                'jpeg': 'image/jpeg',
+                'png': 'image/png',
+                'gif': 'image/gif',
+                'svg': 'image/svg+xml',
+                'xml': 'application/xml',
+                'zip': 'application/zip',
+                'exe': 'application/x-msdownload',
+                'msi': 'application/x-msdownload',
+                'dll': 'application/x-msdownload',
+                'bin': 'application/octet-stream'
+            };
+            
+            return mimeTypes[extension] || 'application/octet-stream';
+        }
+
         assembleAndSaveFile() {
             try {
-                // Create a single Uint8Array to hold the entire file
-                const finalBuffer = new Uint8Array(this.currentFileInfo.size);
+                // Calculate total size of received chunks
+                let totalSize = 0;
+                for (const chunk of this.fileChunks) {
+                    if (chunk) {
+                        totalSize += chunk.length;
+                    }
+                }
+
+                // Create a single buffer for the entire file
+                const finalBuffer = new Uint8Array(totalSize);
                 let offset = 0;
 
                 // Combine all chunks in order
-                for (let i = 0; i < this.fileChunks.length; i++) {
-                    const chunk = this.fileChunks[i];
+                for (const chunk of this.fileChunks) {
                     if (chunk) {
                         finalBuffer.set(chunk, offset);
                         offset += chunk.length;
                     }
                 }
 
-                // Create blob and trigger download
-                const blob = new Blob([finalBuffer], { type: this.currentFileInfo.type });
+                // Get proper MIME type for the file
+                const mimeType = this.getMimeType(this.currentFileInfo.name);
+
+                // Create blob with proper MIME type
+                const blob = new Blob([finalBuffer], { type: mimeType });
                 const url = URL.createObjectURL(blob);
                 
                 const progressContainer = document.getElementById(`progress-${this.currentFileInfo.name}`);
@@ -434,7 +467,7 @@
                 const link = document.createElement('a');
                 link.href = url;
                 link.download = this.currentFileInfo.name;
-                link.textContent = `${this.currentFileInfo.name} (${this.formatFileSize(this.currentFileInfo.size)})`;
+                link.textContent = `${this.currentFileInfo.name} (${this.formatFileSize(totalSize)})`;
                 listItem.appendChild(link);
                 
                 this.receivedFilesList.appendChild(listItem);
@@ -451,7 +484,7 @@
                 link.click();
                 
                 // Clean up the URL object after a short delay
-                setTimeout(() => URL.revokeObjectURL(url), 100);
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
             } catch (error) {
                 this.log(`Error assembling file: ${error.message}`, 'error');
             }
