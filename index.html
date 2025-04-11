@@ -337,11 +337,17 @@
             try {
                 switch(message.type) {
                     case 'fileInfo':
+                        // Initialize receiving process
                         this.currentFileInfo = message.data;
                         this.currentFileBuffer = new Uint8Array(this.currentFileInfo.size);
                         this.currentBufferOffset = 0;
                         this.receivedChunks = new Set();
                         this.lastProgressUpdate = Date.now();
+                        this.receivedSize = 0;
+                        
+                        // Pre-create blob parts array for streaming assembly
+                        this.blobParts = [];
+                        this.nextExpectedOffset = 0;
                         
                         const progressContainer = document.createElement('div');
                         progressContainer.id = `progress-${this.currentFileInfo.name}`;
@@ -358,30 +364,35 @@
                         
                     case 'fileChunk':
                         if (this.currentFileInfo && this.currentFileBuffer) {
-                            // Process chunk immediately
                             const chunk = message.data;
                             const chunkOffset = message.offset;
                             
-                            // Check if we already received this chunk
+                            // Process chunk only if we haven't seen it before
                             if (!this.receivedChunks.has(chunkOffset)) {
-                                this.currentFileBuffer.set(chunk, chunkOffset);
                                 this.receivedChunks.add(chunkOffset);
-                                this.currentBufferOffset = Math.max(this.currentBufferOffset, chunkOffset + chunk.length);
+                                this.receivedSize += chunk.length;
                                 
-                                // Update progress bar less frequently (every 100ms)
+                                // Store chunk directly in blobParts array at correct position
+                                const chunkIndex = Math.floor(chunkOffset / this.CHUNK_SIZE);
+                                this.blobParts[chunkIndex] = new Blob([chunk]);
+                                
+                                // Update progress less frequently
                                 const now = Date.now();
                                 if (now - this.lastProgressUpdate > 100) {
                                     const progressBar = document.querySelector(`#progress-${this.currentFileInfo.name} .progress-bar-fill`);
-                                    const progressPercentage = Math.round((this.currentBufferOffset / this.currentFileInfo.size) * 100);
+                                    const progressPercentage = Math.round((this.receivedSize / this.currentFileInfo.size) * 100);
                                     if (progressBar) {
                                         progressBar.style.width = `${progressPercentage}%`;
                                     }
                                     this.lastProgressUpdate = now;
                                 }
                                 
-                                // Check if file is complete
-                                if (this.currentBufferOffset >= this.currentFileInfo.size) {
-                                    this.saveReceivedFile();
+                                // Check if we can process contiguous chunks
+                                this.processContiguousChunks();
+                                
+                                // If all chunks received, finalize the file
+                                if (this.receivedSize >= this.currentFileInfo.size) {
+                                    this.finalizeAndSaveFile();
                                 }
                             }
                         }
@@ -392,9 +403,16 @@
             }
         }
 
-        saveReceivedFile() {
-            // Create blob and download link immediately
-            const blob = new Blob([this.currentFileBuffer], { type: this.currentFileInfo.type });
+        processContiguousChunks() {
+            // Process chunks that have arrived in order
+            while (this.blobParts[Math.floor(this.nextExpectedOffset / this.CHUNK_SIZE)]) {
+                this.nextExpectedOffset += this.CHUNK_SIZE;
+            }
+        }
+
+        finalizeAndSaveFile() {
+            // Create final blob from all parts
+            const blob = new Blob(this.blobParts.filter(Boolean), { type: this.currentFileInfo.type });
             const url = URL.createObjectURL(blob);
             
             const progressContainer = document.getElementById(`progress-${this.currentFileInfo.name}`);
@@ -415,13 +433,17 @@
             this.receivedFiles.push(this.currentFileInfo);
             this.currentFileInfo = null;
             this.currentFileBuffer = null;
-            this.currentBufferOffset = 0;
             this.receivedChunks = null;
+            this.blobParts = null;
+            this.nextExpectedOffset = 0;
             
             this.log(`File ${link.download} received successfully`, 'success');
             
             // Trigger download automatically
             link.click();
+            
+            // Clean up the URL object
+            setTimeout(() => URL.revokeObjectURL(url), 100);
         }
 
         formatFileSize(bytes) {
