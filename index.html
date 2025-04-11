@@ -268,7 +268,7 @@
             });
         }
 
-        sendFile(file) {
+        async sendFile(file) {
             if (!this.connection || !this.connection.open) {
                 this.log('Connection is not open', 'error');
                 return;
@@ -285,43 +285,58 @@
                 total: fileInfo.size
             };
 
+            // Send file info first
             this.connection.send({
                 type: 'fileInfo',
                 data: fileInfo
             });
 
-            const reader = new FileReader();
-            let offset = 0;
+            try {
+                let offset = 0;
+                const reader = new FileReader();
+                
+                // Convert FileReader to Promise-based operation
+                const readChunk = (start, end) => {
+                    return new Promise((resolve, reject) => {
+                        const slice = file.slice(start, end);
+                        reader.onload = () => resolve(reader.result);
+                        reader.onerror = () => reject(reader.error);
+                        reader.readAsArrayBuffer(slice);
+                    });
+                };
 
-            const readNextChunk = () => {
-                const slice = file.slice(offset, offset + this.CHUNK_SIZE);
-                reader.readAsArrayBuffer(slice);
-            };
+                // Process chunks iteratively instead of recursively
+                while (offset < file.size) {
+                    const end = Math.min(offset + this.CHUNK_SIZE, file.size);
+                    const chunk = await readChunk(offset, end);
+                    
+                    // Convert chunk to Uint8Array and then to regular array
+                    const chunkArray = Array.from(new Uint8Array(chunk));
+                    
+                    // Send chunk in smaller pieces if needed
+                    const maxChunkSize = 16000; // Smaller chunk size to prevent stack overflow
+                    for (let i = 0; i < chunkArray.length; i += maxChunkSize) {
+                        const subChunk = chunkArray.slice(i, i + maxChunkSize);
+                        this.connection.send({
+                            type: 'fileChunk',
+                            name: fileInfo.name,
+                            data: subChunk,
+                            offset: offset + i
+                        });
+                    }
 
-            reader.onload = (e) => {
-                const chunk = e.target.result;
-                this.connection.send({
-                    type: 'fileChunk',
-                    name: fileInfo.name,
-                    data: Array.from(new Uint8Array(chunk)),
-                    offset: offset
-                });
+                    offset = end;
+                    this.fileTransferProgress[fileInfo.name].sent = offset;
 
-                offset += chunk.byteLength;
-                this.fileTransferProgress[fileInfo.name].sent = offset;
-
-                const progressPercentage = Math.round((offset / fileInfo.size) * 100);
-                this.log(`Sending ${fileInfo.name}: ${progressPercentage}%`, 'info');
-
-                if (offset < fileInfo.size) {
-                    readNextChunk();
-                } else {
-                    this.log(`File ${fileInfo.name} sent completely`, 'success');
+                    const progressPercentage = Math.round((offset / file.size) * 100);
+                    this.log(`Sending ${fileInfo.name}: ${progressPercentage}%`, 'info');
                 }
-            };
 
-            readNextChunk();
-            this.log(`Preparing to send file: ${file.name}`, 'info');
+                this.log(`File ${fileInfo.name} sent completely`, 'success');
+                
+            } catch (error) {
+                this.log(`Error sending file: ${error.message}`, 'error');
+            }
         }
 
         handleIncomingMessage(message) {
@@ -329,7 +344,8 @@
                 switch(message.type) {
                     case 'fileInfo':
                         this.currentFileInfo = message.data;
-                        this.currentFileBuffer = [];
+                        this.currentFileBuffer = new Uint8Array(this.currentFileInfo.size);
+                        this.currentBufferOffset = 0;
                         
                         const progressContainer = document.createElement('div');
                         progressContainer.id = `progress-${this.currentFileInfo.name}`;
@@ -343,17 +359,21 @@
                         
                         this.log(`Receiving file: ${this.currentFileInfo.name}`, 'info');
                         break;
+                        
                     case 'fileChunk':
-                        if (this.currentFileInfo) {
-                            this.currentFileBuffer.push(...message.data);
+                        if (this.currentFileInfo && this.currentFileBuffer) {
+                            // Convert chunk array back to Uint8Array and copy to the correct position
+                            const chunk = new Uint8Array(message.data);
+                            this.currentFileBuffer.set(chunk, message.offset);
+                            this.currentBufferOffset = Math.max(this.currentBufferOffset, message.offset + chunk.length);
                             
                             const progressBar = document.querySelector(`#progress-${this.currentFileInfo.name} .progress-bar-fill`);
-                            const progressPercentage = Math.round((this.currentFileBuffer.length / this.currentFileInfo.size) * 100);
+                            const progressPercentage = Math.round((this.currentBufferOffset / this.currentFileInfo.size) * 100);
                             if (progressBar) {
                                 progressBar.style.width = `${progressPercentage}%`;
                             }
                             
-                            if (this.currentFileBuffer.length >= this.currentFileInfo.size) {
+                            if (this.currentBufferOffset >= this.currentFileInfo.size) {
                                 this.saveReceivedFile();
                             }
                         }
@@ -365,7 +385,7 @@
         }
 
         saveReceivedFile() {
-            const blob = new Blob([new Uint8Array(this.currentFileBuffer)], { type: this.currentFileInfo.type });
+            const blob = new Blob([this.currentFileBuffer], { type: this.currentFileInfo.type });
             const url = URL.createObjectURL(blob);
             
             const progressContainer = document.getElementById(`progress-${this.currentFileInfo.name}`);
@@ -378,14 +398,16 @@
             link.href = url;
             link.download = this.currentFileInfo.name;
             link.textContent = `${this.currentFileInfo.name} (${this.formatFileSize(this.currentFileInfo.size)})`;
-            link.click();
             listItem.appendChild(link);
             
             this.receivedFilesList.appendChild(listItem);
             
             this.receivedFiles.push(this.currentFileInfo);
             this.currentFileInfo = null;
-            this.currentFileBuffer = [];
+            this.currentFileBuffer = null;
+            this.currentBufferOffset = 0;
+            
+            this.log(`File ${link.download} received successfully`, 'success');
         }
 
         formatFileSize(bytes) {
