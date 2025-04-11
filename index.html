@@ -344,6 +344,7 @@
                         this.receivedChunks = new Set();
                         this.lastProgressUpdate = Date.now();
                         this.receivedSize = 0;
+                        this.totalChunksSize = 0; // Track total size of received chunks
                         
                         // Calculate expected number of chunks
                         this.expectedChunks = Math.ceil(this.currentFileInfo.size / this.CHUNK_SIZE);
@@ -367,7 +368,7 @@
                         
                     case 'fileChunk':
                         if (this.currentFileInfo) {
-                            const chunk = message.data;
+                            const chunk = new Uint8Array(message.data); // Ensure chunk is Uint8Array
                             const chunkOffset = message.offset;
                             const chunkIndex = Math.floor(chunkOffset / this.CHUNK_SIZE);
                             
@@ -379,8 +380,9 @@
                             
                             // Process chunk only if we haven't seen it before
                             if (!this.receivedChunks.has(chunkIndex)) {
+                                const chunkLength = chunk.byteLength || chunk.length;
                                 this.receivedChunks.add(chunkIndex);
-                                this.receivedSize += chunk.length;
+                                this.totalChunksSize += chunkLength; // Add actual chunk size
                                 this.receivedChunkCount++;
                                 
                                 // Store chunk with boundary checking
@@ -395,15 +397,21 @@
                                 const now = Date.now();
                                 if (now - this.lastProgressUpdate > 100) {
                                     const progressBar = document.querySelector(`#progress-${this.currentFileInfo.name} .progress-bar-fill`);
-                                    const progressPercentage = Math.round((this.receivedSize / this.currentFileInfo.size) * 100);
+                                    const progressPercentage = Math.round((this.totalChunksSize / this.currentFileInfo.size) * 100);
                                     if (progressBar) {
                                         progressBar.style.width = `${progressPercentage}%`;
                                     }
                                     this.lastProgressUpdate = now;
+                                    
+                                    // Log progress periodically
+                                    if (progressPercentage % 10 === 0) {
+                                        this.log(`Received ${this.formatFileSize(this.totalChunksSize)} of ${this.formatFileSize(this.currentFileInfo.size)} (${progressPercentage}%)`, 'info');
+                                    }
                                 }
                                 
                                 // Check if we have received all chunks
                                 if (this.receivedChunkCount === this.expectedChunks) {
+                                    this.log(`All chunks received. Validating file size...`, 'info');
                                     this.assembleAndSaveFile();
                                 }
                             }
@@ -421,40 +429,37 @@
 
         assembleAndSaveFile() {
             try {
-                // Validate total size matches expected size
-                if (this.receivedSize !== this.currentFileInfo.size) {
-                    throw new Error(`Size mismatch: received ${this.receivedSize} bytes but expected ${this.currentFileInfo.size} bytes`);
+                // Calculate and validate total size
+                let calculatedSize = 0;
+                for (const chunk of this.fileChunks) {
+                    if (!chunk) {
+                        throw new Error('Missing chunk detected during assembly');
+                    }
+                    calculatedSize += chunk.byteLength || chunk.length;
                 }
+
+                // Validate total size matches expected size
+                if (calculatedSize !== this.currentFileInfo.size) {
+                    throw new Error(`Size mismatch: received ${calculatedSize} bytes but expected ${this.currentFileInfo.size} bytes`);
+                }
+
+                this.log(`Size validation passed: ${this.formatFileSize(calculatedSize)}`, 'info');
 
                 // Create a single buffer for the entire file
-                const finalBuffer = new Uint8Array(this.currentFileInfo.size);
+                const finalBuffer = new Uint8Array(calculatedSize);
                 let currentOffset = 0;
 
-                // Sort chunks by their index to ensure correct order
-                const sortedIndices = Array.from(this.receivedChunks).sort((a, b) => a - b);
-                
-                for (const chunkIndex of sortedIndices) {
-                    const chunk = this.fileChunks[chunkIndex];
-                    if (!chunk) {
-                        throw new Error(`Missing chunk at index ${chunkIndex}`);
-                    }
-
-                    // Validate chunk boundaries
-                    if (currentOffset + chunk.length > this.currentFileInfo.size) {
-                        throw new Error('Chunk exceeds file size bounds');
-                    }
-
+                // Assemble file from chunks
+                for (let i = 0; i < this.fileChunks.length; i++) {
+                    const chunk = this.fileChunks[i];
+                    const chunkSize = chunk.byteLength || chunk.length;
+                    
                     try {
                         finalBuffer.set(chunk, currentOffset);
-                        currentOffset += chunk.length;
+                        currentOffset += chunkSize;
                     } catch (e) {
-                        throw new Error(`Error setting chunk at offset ${currentOffset}: ${e.message}`);
+                        throw new Error(`Error at chunk ${i}, offset ${currentOffset}: ${e.message}`);
                     }
-                }
-
-                // Validate final size
-                if (currentOffset !== this.currentFileInfo.size) {
-                    throw new Error(`Assembly incomplete: processed ${currentOffset} of ${this.currentFileInfo.size} bytes`);
                 }
 
                 // Get proper MIME type for the file
@@ -473,7 +478,7 @@
                 const link = document.createElement('a');
                 link.href = url;
                 link.download = this.currentFileInfo.name;
-                link.textContent = `${this.currentFileInfo.name} (${this.formatFileSize(this.currentFileInfo.size)})`;
+                link.textContent = `${this.currentFileInfo.name} (${this.formatFileSize(calculatedSize)})`;
                 listItem.appendChild(link);
                 
                 this.receivedFilesList.appendChild(listItem);
