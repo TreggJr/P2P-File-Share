@@ -558,12 +558,6 @@
                         throw new Error(`Missing chunk ${i}`);
                     }
 
-                    // Verify each chunk as we assemble
-                    const expectedSize = this.receivedChunks.get(i);
-                    if (chunk.byteLength !== expectedSize) {
-                        throw new Error(`Chunk ${i} size mismatch: expected ${expectedSize} but got ${chunk.byteLength}`);
-                    }
-
                     finalBuffer.set(chunk, offset);
                     offset += chunk.byteLength;
                 }
@@ -572,67 +566,8 @@
                 const mimeType = this.getMimeType(this.currentFileInfo.name);
                 const blob = new Blob([finalBuffer], { type: mimeType });
 
-                // Handle zip files (auto-extract)
-                if (this.currentFileInfo.name.endsWith('.zip')) {
-                    try {
-                        const zip = await JSZip.loadAsync(blob);
-                        
-                        // Create container for the extracted files
-                        const folderName = this.currentFileInfo.name.slice(0, -4); // Remove .zip
-                        const folderContainer = document.createElement('div');
-                        folderContainer.id = `folder-${folderName}`;
-                        folderContainer.innerHTML = `<h4>📁 ${folderName}</h4>`;
-                        this.receivedFilesList.appendChild(folderContainer);
-
-                        // Extract each file
-                        for (const [relativePath, zipEntry] of Object.entries(zip.files)) {
-                            if (!zipEntry.dir) {
-                                const content = await zipEntry.async('blob');
-                                const url = URL.createObjectURL(content);
-                                
-                                // Create nested folder structure if needed
-                                const pathParts = relativePath.split('/');
-                                let currentContainer = folderContainer;
-                                
-                                // Create folders
-                                for (let i = 0; i < pathParts.length - 1; i++) {
-                                    const folderId = `folder-${folderName}-${pathParts.slice(0, i + 1).join('-')}`;
-                                    let folderElement = document.getElementById(folderId);
-                                    
-                                    if (!folderElement) {
-                                        folderElement = document.createElement('div');
-                                        folderElement.id = folderId;
-                                        folderElement.style.marginLeft = '20px';
-                                        folderElement.innerHTML = `<h4>📁 ${pathParts[i]}</h4>`;
-                                        currentContainer.appendChild(folderElement);
-                                    }
-                                    
-                                    currentContainer = folderElement;
-                                }
-
-                                // Add file link
-                                const listItem = document.createElement('div');
-                                listItem.style.marginLeft = '20px';
-                                const link = document.createElement('a');
-                                link.href = url;
-                                link.download = pathParts[pathParts.length - 1];
-                                link.textContent = `📄 ${pathParts[pathParts.length - 1]} (${this.formatFileSize(content.size)})`;
-                                listItem.appendChild(link);
-                                currentContainer.appendChild(listItem);
-                            }
-                        }
-
-                        this.log(`Folder "${folderName}" extracted successfully`, 'success');
-                        
-                    } catch (error) {
-                        this.log(`Error extracting zip: ${error.message}`, 'error');
-                        // If extraction fails, fall back to downloading the zip file
-                        this.downloadFile(blob, this.currentFileInfo.name);
-                    }
-                } else {
-                    // Handle regular files
-                    this.downloadFile(blob, this.currentFileInfo.name);
-                }
+                // Download the file directly, whether it's a ZIP or regular file
+                this.downloadFile(blob, this.currentFileInfo.name);
 
                 // Clean up
                 this.cleanupTransfer();
@@ -660,6 +595,15 @@
             link.textContent = `${filename} (${this.formatFileSize(blob.size)})`;
             listItem.appendChild(link);
             this.receivedFilesList.appendChild(listItem);
+            
+            // Add a note if it's a ZIP file
+            if (filename.endsWith('.zip')) {
+                const note = document.createElement('span');
+                note.style.marginLeft = '10px';
+                note.style.color = '#666';
+                note.textContent = '(ZIP folder)';
+                listItem.appendChild(note);
+            }
             
             this.log(`File ${filename} ready for download`, 'success');
             
