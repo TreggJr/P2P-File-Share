@@ -87,8 +87,17 @@
 
     <div id="file-section" style="display:none;">
         <h2>File Transfer</h2>
-        <input type="file" id="file-input" multiple>
-        <button id="send-file-btn" disabled>Send File(s)</button>
+        <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+            <div style="flex: 1;">
+                <input type="file" id="file-input" multiple>
+                <label for="file-input" style="display: block; font-size: 0.9em; color: #666;">Select Files</label>
+            </div>
+            <div style="flex: 1;">
+                <input type="file" id="folder-input" webkitdirectory directory multiple>
+                <label for="folder-input" style="display: block; font-size: 0.9em; color: #666;">Select Folder</label>
+            </div>
+        </div>
+        <button id="send-file-btn" disabled>Send Files/Folder</button>
         
         <div id="file-list">
             <h3>Received Files:</h3>
@@ -106,6 +115,9 @@
             // Add chunk tracking
             this.expectedChunks = 0;
             this.receivedChunkCount = 0;
+
+            this.pendingFiles = new Map(); // Track files to be sent
+            this.currentFolderStructure = null;
 
             this.initializeDOMElements();
             this.initializeEventListeners();
@@ -183,6 +195,7 @@
             this.logElement = document.getElementById('log');
             this.fileSection = document.getElementById('file-section');
             this.fileInput = document.getElementById('file-input');
+            this.folderInput = document.getElementById('folder-input');
             this.sendFileBtn = document.getElementById('send-file-btn');
             this.receivedFilesList = document.getElementById('received-files');
         }
@@ -209,10 +222,28 @@
             });
 
             this.sendFileBtn.addEventListener('click', () => {
-                const files = this.fileInput.files;
-                if (files.length > 0 && this.connection && this.connection.open) {
-                    Array.from(files).forEach(file => this.sendFile(file));
+                if (this.connection && this.connection.open) {
+                    // Handle both files and folders
+                    const regularFiles = Array.from(this.fileInput.files);
+                    const folderFiles = Array.from(this.folderInput.files);
+                    
+                    if (folderFiles.length > 0) {
+                        this.sendFolder(folderFiles);
+                    } else if (regularFiles.length > 0) {
+                        regularFiles.forEach(file => this.sendFile(file));
+                    }
                 }
+            });
+
+            // Enable send button when either files or folder is selected
+            this.fileInput.addEventListener('change', () => {
+                this.folderInput.value = ''; // Clear folder selection
+                this.sendFileBtn.disabled = !this.connection || !this.connection.open || this.fileInput.files.length === 0;
+            });
+
+            this.folderInput.addEventListener('change', () => {
+                this.fileInput.value = ''; // Clear file selection
+                this.sendFileBtn.disabled = !this.connection || !this.connection.open || this.folderInput.files.length === 0;
             });
         }
 
@@ -274,16 +305,56 @@
             });
         }
 
-        async sendFile(file) {
+        async sendFolder(files) {
+            if (!this.connection || !this.connection.open || files.length === 0) {
+                return;
+            }
+
+            // Create folder structure
+            const folderStructure = {};
+            for (const file of files) {
+                const relativePath = file.webkitRelativePath;
+                const pathParts = relativePath.split('/');
+                let currentLevel = folderStructure;
+
+                // Build folder structure
+                for (let i = 0; i < pathParts.length - 1; i++) {
+                    const part = pathParts[i];
+                    if (!currentLevel[part]) {
+                        currentLevel[part] = {};
+                    }
+                    currentLevel = currentLevel[part];
+                }
+            }
+
+            // Send folder structure first
+            this.connection.send({
+                type: 'folderStructure',
+                data: {
+                    name: files[0].webkitRelativePath.split('/')[0],
+                    structure: folderStructure
+                }
+            });
+
+            // Send each file with its relative path
+            for (const file of files) {
+                await this.sendFile(file, file.webkitRelativePath);
+            }
+
+            this.log(`Folder sent: ${files[0].webkitRelativePath.split('/')[0]}`, 'success');
+        }
+
+        async sendFile(file, relativePath = null) {
             if (!this.connection || !this.connection.open) {
                 this.log('Connection is not open', 'error');
                 return;
             }
 
             const fileInfo = {
-                name: file.name,
+                name: relativePath || file.name,
                 size: file.size,
-                type: this.getMimeType(file.name) // Use proper MIME type
+                type: this.getMimeType(file.name),
+                isPartOfFolder: !!relativePath
             };
 
             // Send file info first
@@ -338,6 +409,17 @@
         handleIncomingMessage(message) {
             try {
                 switch(message.type) {
+                    case 'folderStructure':
+                        this.currentFolderStructure = message.data;
+                        this.log(`Receiving folder: ${message.data.name}`, 'info');
+                        
+                        // Create folder structure in the UI
+                        const folderContainer = document.createElement('div');
+                        folderContainer.id = `folder-${message.data.name}`;
+                        folderContainer.innerHTML = `<h4>📁 ${message.data.name}</h4>`;
+                        this.receivedFilesList.appendChild(folderContainer);
+                        break;
+
                     case 'fileInfo':
                         // Initialize receiving process with proper size tracking
                         this.currentFileInfo = message.data;
@@ -363,6 +445,27 @@
                         this.receivedFilesList.appendChild(progressContainer);
                         
                         this.log(`Receiving file: ${this.currentFileInfo.name} (${this.formatFileSize(this.currentFileInfo.size)})`, 'info');
+                        
+                        if (message.data.isPartOfFolder) {
+                            // Create nested folder structure if needed
+                            const pathParts = message.data.name.split('/');
+                            let currentContainer = document.getElementById(`folder-${pathParts[0]}`);
+                            
+                            for (let i = 1; i < pathParts.length - 1; i++) {
+                                const folderId = `folder-${pathParts.slice(0, i + 1).join('-')}`;
+                                let folderElement = document.getElementById(folderId);
+                                
+                                if (!folderElement) {
+                                    folderElement = document.createElement('div');
+                                    folderElement.id = folderId;
+                                    folderElement.style.marginLeft = '20px';
+                                    folderElement.innerHTML = `<h4>📁 ${pathParts[i]}</h4>`;
+                                    currentContainer.appendChild(folderElement);
+                                }
+                                
+                                currentContainer = folderElement;
+                            }
+                        }
                         break;
                         
                     case 'fileChunk':
