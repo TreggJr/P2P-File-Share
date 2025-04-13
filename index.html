@@ -675,6 +675,11 @@
             }
         }
 
+        // Add new helper method
+        sanitizeIdString(str) {
+            return str.replace(/[^a-z0-9]/gi, '-');
+        }
+
         handleIncomingMessage(message) {
             try {
                 switch(message.type) {
@@ -703,8 +708,9 @@
                         // Initialize array to store chunks
                         this.fileChunks = new Array(this.expectedChunks);
                         
+                        const safeFileId = this.sanitizeIdString(this.currentFileInfo.name);
                         const progressContainer = document.createElement('div');
-                        progressContainer.id = `progress-${this.currentFileInfo.name}`;
+                        progressContainer.id = `progress-${safeFileId}`;
                         progressContainer.innerHTML = `
                             <p>Receiving: ${this.currentFileInfo.name}</p>
                             <div class="progress-bar">
@@ -746,7 +752,8 @@
                                 // Update progress less frequently
                                 const now = Date.now();
                                 if (now - this.lastProgressUpdate > 100) {
-                                    const progressBar = document.querySelector(`#progress-${this.currentFileInfo.name} .progress-bar-fill`);
+                                    const safeFileId = this.sanitizeIdString(this.currentFileInfo.name);
+                                    const progressBar = document.querySelector(`#progress-${safeFileId} .progress-bar-fill`);
                                     const progressPercentage = Math.round((this.totalChunksSize / this.currentFileInfo.size) * 100);
                                     if (progressBar) {
                                         progressBar.style.width = `${progressPercentage}%`;
@@ -798,9 +805,12 @@
             this.receivedChunks = null;
             this.totalChunksSize = 0;
             
-            const progressContainer = document.getElementById(`progress-${this.currentFileInfo?.name}`);
-            if (progressContainer) {
-                progressContainer.remove();
+            if (this.currentFileInfo) {
+                const safeFileId = this.sanitizeIdString(this.currentFileInfo.name);
+                const progressContainer = document.getElementById(`progress-${safeFileId}`);
+                if (progressContainer) {
+                    progressContainer.remove();
+                }
             }
             
             this.currentFileInfo = null;
@@ -843,7 +853,8 @@
             const url = URL.createObjectURL(blob);
             
             // Remove progress indicator
-            const progressContainer = document.getElementById(`progress-${filename}`);
+            const safeFileId = this.sanitizeIdString(filename);
+            const progressContainer = document.getElementById(`progress-${safeFileId}`);
             if (progressContainer) {
                 progressContainer.remove();
             }
