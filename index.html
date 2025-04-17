@@ -8,13 +8,22 @@
         :root {
             --primary-color: #2563eb;
             --primary-hover: #1d4ed8;
-            --bg-color: #f8fafc;
-            --card-bg: #ffffff;
-            --text-primary: #1e293b;
-            --text-secondary: #64748b;
-            --border-color: #e2e8f0;
+            --bg-color: rgba(248, 250, 252, 0.1);
+            --card-bg: rgba(255, 255, 255, 0.1);
+            --text-primary: #ffffff;
+            --text-secondary: #f1f5f9;
+            --border-color: rgba(226, 232, 240, 0.2);
             --success-color: #22c55e;
             --error-color: #ef4444;
+        }
+
+        @keyframes rainbow-border {
+            0% { border-image: linear-gradient(45deg, #ff0000, #ff8000) 1; }
+            20% { border-image: linear-gradient(45deg, #ff8000, #ffff00) 1; }
+            40% { border-image: linear-gradient(45deg, #ffff00, #00ff00) 1; }
+            60% { border-image: linear-gradient(45deg, #00ff00, #0000ff) 1; }
+            80% { border-image: linear-gradient(45deg, #0000ff, #8000ff) 1; }
+            100% { border-image: linear-gradient(45deg, #8000ff, #ff0000) 1; }
         }
 
         * {
@@ -25,11 +34,25 @@
 
         body {
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-            background-color: var(--bg-color);
+            background-image: url('background.jpg');
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
             color: var(--text-primary);
             line-height: 1.6;
             padding: 2rem;
             min-height: 100vh;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.3);
+            z-index: -1;
         }
 
         .container {
@@ -54,11 +77,21 @@
 
         #connection-section, #file-section {
             background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
             border-radius: 12px;
             padding: 2rem;
             margin-bottom: 2rem;
-            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
-            border: 1px solid var(--border-color);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+            border: 2px solid transparent;
+            animation: rainbow-border 8s linear infinite;
+            transition: all 0.5s ease;
+            transform-origin: center;
+            transform: scale(0.85);
+        }
+
+        #connection-section:hover, #file-section:hover {
+            transform: scale(1);
         }
 
         input {
@@ -69,7 +102,12 @@
             margin-bottom: 1rem;
             font-size: 1rem;
             transition: all 0.2s;
-            background: var(--bg-color);
+            background: rgba(248, 250, 252, 0.1);
+            color: var(--text-primary);
+        }
+
+        input::placeholder {
+            color: rgba(255, 255, 255, 0.6);
         }
 
         input:focus {
